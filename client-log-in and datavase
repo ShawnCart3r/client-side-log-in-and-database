@@ -1,0 +1,1092 @@
+<?php
+/*
+Plugin Name: TheraConnect Clients (DB + Admin List/Export + Verify + WP Account + Delete)
+Description: Client registration to custom tables + required email/password + email verification (blocks WP login until verified) + resend verify + full-page POST (no JSON) + safe duplicate-email handling. Adds DB tables, Admin list/search/export, Dashboard widget, and delete (single + bulk). Separate from Pros. Keeps original CSS/markup intact.
+Version: 2.4
+Author: You
+*/
+
+if (!defined('ABSPATH')) exit;
+
+/* ==============================
+ * Constants
+ * ============================== */
+if (!defined('TC_USERS_TABLE'))        define('TC_USERS_TABLE', 'Users');
+if (!defined('TC_VISITOR_REQ_TABLE'))  define('TC_VISITOR_REQ_TABLE', 'VisitorRequests');
+if (!defined('TC_CLIENT_HOME'))        define('TC_CLIENT_HOME', 'https://theraconnect.net/');
+if (!defined('TC_SUCCESS_REDIRECT'))   define('TC_SUCCESS_REDIRECT', 'https://theraconnect.net/thank-you/'); // post-submit + verify success target
+
+/** Verify table helper (safer than constant at load time) */
+function tc_client_verify_table() {
+  global $wpdb;
+  $prefix = isset($wpdb->prefix) ? $wpdb->prefix : 'wp_';
+  return $prefix . 'tc_email_verify';
+}
+
+/* ==============================
+ * Helpers
+ * ============================== */
+if (!function_exists('tc_null_if_empty')) {
+  function tc_null_if_empty($v) {
+    $v = is_string($v) ? trim($v) : $v;
+    return ($v === '' || $v === null) ? null : $v;
+  }
+}
+
+/** Normalize visit type to match DB */
+function tc_norm_visit($raw) {
+  $raw = strtolower(trim($raw ?? ''));
+  if ($raw === 'virtual') return 'Telemed';
+  if ($raw === 'in-person' || $raw === 'in person') return 'In-Person';
+  if ($raw === 'either') return 'Telemed/In-Person';
+  return '';
+}
+
+/* ==============================
+ * Mail helpers (scoped to this plugin)
+ * ============================== */
+function tc_default_headers() {
+  return [
+    'From: TheraConnect <admin@theraconnect.net>',
+    'Reply-To: admin@theraconnect.net',
+    'Content-Type: text/plain; charset=UTF-8',
+  ];
+}
+
+function tc_send_mail($to, $subject, $body, $headers = null) {
+  if ($headers === null) $headers = tc_default_headers();
+  return wp_mail($to, $subject, $body, $headers);
+}
+
+/* ==============================
+ * Activation: ensure DB tables exist
+ * ============================== */
+register_activation_hook(__FILE__, function () {
+  global $wpdb;
+  require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+  $charset = $wpdb->get_charset_collate();
+
+  // 1) Email verify table for Clients
+  $verify_table = tc_client_verify_table();
+  $sql_verify = "CREATE TABLE IF NOT EXISTS `$verify_table` (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    VisitorID BIGINT UNSIGNED NOT NULL,
+    Token VARCHAR(64) NOT NULL,
+    Verified TINYINT(1) NOT NULL DEFAULT 0,
+    CreatedAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_visitor (VisitorID),
+    KEY idx_token (Token),
+    KEY idx_verified (Verified),
+    KEY idx_created (CreatedAt)
+  ) $charset;";
+  dbDelta($sql_verify);
+
+  // 2) Main Users table (shared shape, safe if already exists)
+  $users_tbl = TC_USERS_TABLE;
+  $sql_users = "CREATE TABLE IF NOT EXISTS `$users_tbl` (
+    UserID BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    UserType VARCHAR(32) NOT NULL,                    -- 'Visitor' or 'Professional'
+    CompanyName VARCHAR(255) NULL,
+    DBA VARCHAR(255) NULL,
+    FirstName VARCHAR(120) NOT NULL,
+    LastName VARCHAR(120) NOT NULL,
+    Title VARCHAR(255) NULL,
+    NPI VARCHAR(32) NULL,
+    MobilePhone VARCHAR(64) NULL,
+    Phone VARCHAR(64) NULL,
+    Email VARCHAR(190) NOT NULL,                      -- 190 for utf8mb4 index safety
+    Street VARCHAR(255) NULL,
+    City VARCHAR(120) NULL,
+    StateProvince VARCHAR(120) NULL,
+    PostalZipCode VARCHAR(32) NULL,
+    Country VARCHAR(120) NULL,
+    PreferredVisitType VARCHAR(32) NULL,              -- Telemed / In-Person / Telemed/In-Person
+    InsuranceRequired TINYINT(1) NULL,                -- 1 yes, 0 no, NULL unknown
+    CreatedAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (UserID),
+    UNIQUE KEY uniq_email (Email),
+    KEY idx_usertype (UserType),
+    KEY idx_lastname (LastName),
+    KEY idx_created (CreatedAt)
+  ) $charset;";
+  dbDelta($sql_users);
+
+  // 3) VisitorRequests table
+  $visreq_tbl = TC_VISITOR_REQ_TABLE;
+  $sql_visreq = "CREATE TABLE IF NOT EXISTS `$visreq_tbl` (
+    RequestID BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    VisitorID BIGINT UNSIGNED NOT NULL,
+    HealthcareProfessionalPreferred BIGINT UNSIGNED NULL,
+    PreferredVisitType VARCHAR(32) NULL,
+    InsuranceRequired TINYINT(1) NULL,
+    PrimaryInsurance VARCHAR(255) NULL,
+    PrimaryInsuranceNumber VARCHAR(255) NULL,
+    CreatedAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (RequestID),
+    KEY idx_visitor (VisitorID),
+    KEY idx_created (CreatedAt)
+  ) $charset;";
+  dbDelta($sql_visreq);
+});
+
+/* ==============================
+ * Core processing (full-page POST)
+ * ============================== */
+function tc_handle_client_submission() {
+  if ($_SERVER['REQUEST_METHOD'] !== 'POST') return;
+  if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'save_client_nonce')) {
+    wp_die('Bad nonce');
+  }
+
+  // Sanitize inputs
+  $first    = sanitize_text_field($_POST['firstName'] ?? '');
+  $last     = sanitize_text_field($_POST['lastName'] ?? '');
+  $email    = tc_null_if_empty(sanitize_email($_POST['email'] ?? ''));
+  $wp_pass  = (string)($_POST['wp_password'] ?? '');
+  $wp_pass2 = (string)($_POST['wp_password_confirm'] ?? '');
+
+  $mobile   = sanitize_text_field($_POST['mobilePhone'] ?? '');
+  $phone    = sanitize_text_field($_POST['phone'] ?? '');
+  $street   = sanitize_text_field($_POST['street'] ?? '');
+  $city     = sanitize_text_field($_POST['city'] ?? '');
+  $state    = sanitize_text_field($_POST['state'] ?? '');
+  $zip      = sanitize_text_field($_POST['zip'] ?? '');
+  $country  = sanitize_text_field($_POST['country'] ?? '');
+
+  $visitRaw = $_POST['visitType'] ?? '';
+  $visit    = tc_norm_visit($visitRaw);
+
+  $ins_req_val = $_POST['insuranceRequired'] ?? '';
+  $ins_req     = ($ins_req_val === 'Yes') ? 1 : (($ins_req_val === 'No') ? 0 : null);
+
+  $ins_prov = sanitize_text_field($_POST['insuranceProvider'] ?? '');
+  $ins_num  = sanitize_text_field($_POST['insuranceNumber'] ?? '');
+  $pref_txt = sanitize_text_field($_POST['preferredProvider'] ?? '');
+
+  $consent  = ($_POST['consent'] ?? '') === 'Yes';
+
+  // Required field checks
+  $errors = [];
+  if (!$first) $errors[] = 'First Name is required.';
+  if (!$last)  $errors[] = 'Last Name is required.';
+  if (!$email || !is_email($email)) $errors[] = 'A valid Email Address is required.';
+  if (!$wp_pass || strlen($wp_pass) < 8) $errors[] = 'Password must be at least 8 characters.';
+  if ($wp_pass2 !== '' && $wp_pass !== $wp_pass2) $errors[] = 'Passwords do not match.';
+  if (!in_array($visitRaw, ['virtual','in-person','either'], true)) $errors[] = 'Please select Preferred Type of Visit.';
+  if (!$consent) $errors[] = 'Please consent to share your info.';
+
+  if (!empty($errors)) wp_die(implode('<br>', array_map('esc_html', $errors)));
+
+  global $wpdb;
+
+  /* 1) Insert/Upsert into Users */
+  $users_tbl = TC_USERS_TABLE;
+
+  $user_row = [
+    'UserType'           => 'Visitor',
+    'CompanyName'        => null,
+    'DBA'                => null,
+    'FirstName'          => $first,
+    'LastName'           => $last,
+    'Title'              => null,
+    'NPI'                => null,
+    'MobilePhone'        => $mobile,
+    'Phone'              => $phone,
+    'Email'              => $email,
+    'Street'             => $street,
+    'City'               => $city,
+    'StateProvince'      => $state,
+    'PostalZipCode'      => $zip,
+    'Country'            => $country,
+    'PreferredVisitType' => $visit,
+    'InsuranceRequired'  => $ins_req,
+  ];
+
+  $fmt_user = [
+    '%s','%s','%s','%s','%s','%s','%s',
+    '%s','%s','%s','%s','%s','%s','%s',
+    '%s','%s','%d'
+  ];
+
+  $ok_user = $wpdb->insert($users_tbl, $user_row, $fmt_user);
+
+  if ($ok_user) {
+    $visitor_id = (int)$wpdb->insert_id;
+  } else {
+    // Duplicate email in custom Users table? Reuse existing row.
+    $err = $wpdb->last_error;
+    if (strpos($err, 'Duplicate entry') !== false && strpos($err, "for key 'Email'") !== false) {
+      $visitor_id = (int)$wpdb->get_var($wpdb->prepare(
+        "SELECT UserID FROM `$users_tbl` WHERE Email=%s ORDER BY UserID DESC LIMIT 1", $email
+      ));
+      if ($visitor_id) {
+        $wpdb->update($users_tbl, $user_row, ['UserID' => $visitor_id], $fmt_user, ['%d']);
+      } else {
+        wp_die('DB error (Users duplicate): ' . esc_html($err));
+      }
+    } else {
+      wp_die('DB error (Users): ' . esc_html($err));
+    }
+  }
+
+  /* 2) Resolve preferred professional (optional) */
+  $prof_id = null;
+  if ($pref_txt !== '') {
+    $like = '%' . $wpdb->esc_like($pref_txt) . '%';
+    $sql = $wpdb->prepare(
+      "SELECT UserID FROM ".TC_USERS_TABLE."
+       WHERE UserType='Professional'
+         AND CONCAT_WS(' ', FirstName, LastName) LIKE %s
+       LIMIT 1", $like
+    );
+    $found = $wpdb->get_var($sql);
+    if ($found) $prof_id = (int)$found;
+  }
+
+  /* 3) Insert Visitor Request */
+  $visreq_tbl = TC_VISITOR_REQ_TABLE;
+  $vr_row = [
+    'VisitorID'                       => $visitor_id,
+    'HealthcareProfessionalPreferred' => $prof_id,
+    'PreferredVisitType'              => $visit,
+    'InsuranceRequired'               => $ins_req,
+    'PrimaryInsurance'                => $ins_prov,
+    'PrimaryInsuranceNumber'          => $ins_num,
+  ];
+  $ok_vr = $wpdb->insert($visreq_tbl, $vr_row, ['%d','%d','%s','%d','%s','%s']);
+  if (!$ok_vr) wp_die('DB error (VisitorRequests): ' . esc_html($wpdb->last_error));
+
+  /* 4) Upsert verify token */
+  $verify_table = tc_client_verify_table();
+  $token = wp_generate_password(32, false);
+  $wpdb->replace($verify_table, [
+    'VisitorID' => $visitor_id,
+    'Token'     => $token,
+    'Verified'  => 0,
+  ], ['%d','%s','%d']);
+
+  /* 5) Create/Link WP account */
+  $existing_uid = email_exists($email);
+  if ($existing_uid) {
+    update_user_meta($existing_uid, 'tc_linked_visitor_id', $visitor_id);
+  } else {
+    $username = sanitize_user(current(explode('@', $email)));
+    if (username_exists($username)) $username .= '_' . wp_generate_password(4, false);
+    $uid = wp_create_user($username, $wp_pass, $email);
+    if (!is_wp_error($uid)) {
+      wp_update_user(['ID' => $uid, 'first_name' => $first, 'last_name' => $last, 'role' => 'subscriber']);
+      update_user_meta($uid, 'tc_linked_visitor_id', $visitor_id);
+      update_user_meta($uid, 'tc_email_verified', 0); // block login until verified
+    } else {
+      error_log('TC Client: wp_create_user error: ' . $uid->get_error_message());
+    }
+  }
+
+  /* 6) Send verification email (scoped sender) */
+  if ($email) tc_send_verify_email($email, $first ?: $email, $visitor_id, $token);
+
+  /* 7) Notify admin (scoped sender) */
+  $admin_email = 'admin@theraconnect.net';
+  $admin_subj  = 'New Client Registration (pending verify)';
+  $admin_body  = "A new client registered (pending verification):\n\n".
+                 "Name: $first $last\nEmail: ".($email ?: '[none]')."\nPhone: ".($phone ?: $mobile ?: '[none]')."\n".
+                 "City/State: $city, $state\nVisit Type: $visit\nInsurance Required: " . ($ins_req === 1 ? 'Yes' : ($ins_req === 0 ? 'No' : '')) . "\n".
+                 "Preferred Professional (text): $pref_txt\n\nVisitorID: $visitor_id\n";
+  if ($admin_email) tc_send_mail($admin_email, $admin_subj, $admin_body);
+
+  /* 8) Hard redirect to Thank You */
+  wp_safe_redirect( TC_SUCCESS_REDIRECT );
+  exit;
+}
+
+/* ==============================
+ * Email helper
+ * ============================== */
+function tc_send_verify_email($email, $first, $visitor_id, $token) {
+  $verify_url = add_query_arg([
+    'tc_verify' => '1',
+    'vid'       => $visitor_id,
+    'token'     => $token,
+  ], TC_CLIENT_HOME);
+
+  $site  = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+  $subj  = "Thank you for joining $site";
+  $body  = "Hi $first,\n\n"
+         . "Thank you for joining $site!\n\n"
+         . "Please confirm your email by clicking the link below:\n"
+         . $verify_url . "\n\n"
+         . "If you didn’t submit this, you can ignore this email.";
+
+  // Use scoped sender
+  tc_send_mail($email, $subj, $body);
+}
+
+/* ==============================
+ * Template routing: submission + verify + public resend
+ * ============================== */
+add_action('template_redirect', function () {
+  // 1) Full-page submission endpoint
+  if (isset($_GET['tc_client_submit'])) {
+    tc_handle_client_submission();
+    return;
+  }
+
+  // 2) Public resend POST
+  if (isset($_GET['tc_resend_public']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $nonce = $_POST['_wpnonce'] ?? '';
+    if (!wp_verify_nonce($nonce, 'tc_public_resend')) wp_die('Invalid request.');
+    $res = tc_public_resend_verify($_POST['resend_email'] ?? '');
+    status_header(200);
+    ?>
+    <!doctype html>
+    <html <?php language_attributes(); ?>>
+    <head>
+      <meta charset="<?php bloginfo('charset'); ?>">
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title><?php echo $res['ok'] ? 'Verification Email Sent' : 'Resend Failed'; ?></title>
+      <?php wp_head(); ?>
+      <style>
+        .tc-verify-wrap{max-width:640px;margin:8rem auto;padding:2rem;border-radius:14px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08);font-family:system-ui,-apple-system,Segoe UI,Roboto}
+        .tc-ok{color:#136f35}.tc-bad{color:#b71c1c}
+        .tc-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:8px}
+        .tc-btn{display:inline-block;padding:.65rem 1rem;border-radius:10px;text-decoration:none}
+        .tc-primary{background:#3f51b5;color:#fff}
+        .tc-ghost{border:1px solid #dcdce7}
+      </style>
+    </head>
+    <body>
+      <div class="tc-verify-wrap">
+        <h1><?php echo $res['ok'] ? 'Check your inbox' : 'Resend verification'; ?></h1>
+        <p class="<?php echo $res['ok'] ? 'tc-ok' : 'tc-bad'; ?>"><?php echo esc_html($res['msg']); ?></p>
+        <div class="tc-actions">
+          <a class="tc-btn tc-primary" href="<?php echo esc_url( TC_SUCCESS_REDIRECT ); ?>">Go to TheraConnect</a>
+        </div>
+      </div>
+      <?php wp_footer(); ?>
+    </body>
+    </html>
+    <?php
+    exit;
+  }
+
+  // 3) Verification view (kept CSS as-is, redirect to Thank You on success)
+  if (!isset($_GET['tc_verify'])) return;
+
+  $vid   = absint($_GET['vid'] ?? 0);
+  $token = sanitize_text_field($_GET['token'] ?? '');
+
+  status_header(200);
+  nocache_headers();
+
+  global $wpdb;
+  $ok = false;
+  if ($vid && $token) {
+    $verify_table = tc_client_verify_table();
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM `$verify_table` WHERE VisitorID=%d", $vid));
+    if ($row && hash_equals($row->Token, $token) && (int)$row->Verified === 0) {
+      $wpdb->update($verify_table, ['Verified' => 1], ['VisitorID' => $vid], ['%d'], ['%d']);
+      $ok = true;
+
+      // Flip any linked WP users to verified
+      $wp_users = get_users([
+        'meta_key'   => 'tc_linked_visitor_id',
+        'meta_value' => $vid,
+        'fields'     => 'ID',
+      ]);
+      foreach ($wp_users as $uid) {
+        update_user_meta($uid, 'tc_email_verified', 1);
+      }
+    }
+  }
+
+  ?>
+  <!doctype html>
+  <html <?php language_attributes(); ?>>
+  <head>
+    <meta charset="<?php bloginfo('charset'); ?>">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title><?php echo $ok ? 'Email verified' : 'Verification failed'; ?></title>
+    <?php wp_head(); ?>
+    <style>
+      .tc-verify-wrap{max-width:640px;margin:8rem auto;padding:2rem;border-radius:14px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08);font-family:system-ui,-apple-system,Segoe UI,Roboto}
+      .tc-verify-wrap h1{margin:0 0 .5rem;font-size:1.7rem}
+      .tc-verify-wrap p{margin:0 0 1rem}
+      .tc-ok{color:#136f35}.tc-bad{color:#b71c1c}
+      .tc-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:8px}
+      .tc-btn{display:inline-block;padding:.65rem 1rem;border-radius:10px;text-decoration:none}
+      .tc-primary{background:#3f51b5;color:#fff}
+      .tc-ghost{border:1px solid #dcdce7}
+      .tc-resend-box{margin-top:12px;padding:12px;border:1px solid #dcdce7;border-radius:10px;background:#fafbff}
+      .tc-resend-box label{display:block;margin-bottom:6px;font-weight:600}
+      .tc-resend-box input[type="email"]{width:100%;padding:.6rem;border:1px solid #dcdce7;border-radius:8px}
+      .tc-resend-box button{margin-top:8px;padding:.6rem 1rem;border-radius:8px;background:#3f51b5;color:#fff;border:none;cursor:pointer}
+    </style>
+  </head>
+  <body>
+    <div class="tc-verify-wrap">
+      <h1><?php echo $ok ? 'Email verified' : 'Verification failed'; ?></h1>
+      <?php if ($ok): ?>
+        <p class="tc-ok">Thanks! Your email has been confirmed.</p>
+        <div class="tc-actions">
+          <a class="tc-btn tc-primary" href="<?php echo esc_url( TC_SUCCESS_REDIRECT ); ?>">Continue</a>
+        </div>
+        <script>
+          setTimeout(function(){ window.location.href = "<?php echo esc_js( TC_SUCCESS_REDIRECT ); ?>"; }, 2000);
+        </script>
+      <?php else: ?>
+        <p class="tc-bad">The verification link is invalid or already used.</p>
+        <div class="tc-resend-box">
+          <form method="post" action="<?php echo esc_url( add_query_arg('tc_resend_public','1', TC_CLIENT_HOME) ); ?>">
+            <?php wp_nonce_field('tc_public_resend'); ?>
+            <label for="resend_email">Didn’t get the email? Enter your address and we’ll resend it:</label>
+            <input type="email" id="resend_email" name="resend_email" placeholder="your@email.com" required>
+            <button type="submit">Resend verification email</button>
+          </form>
+        </div>
+        <div class="tc-actions" style="margin-top:12px;">
+          <a class="tc-btn tc-ghost" href="<?php echo esc_url( TC_SUCCESS_REDIRECT ); ?>">Go to TheraConnect</a>
+        </div>
+      <?php endif; ?>
+    </div>
+    <?php wp_footer(); ?>
+  </body>
+  </html>
+  <?php
+  exit;
+});
+
+/** Public resend-by-email */
+function tc_public_resend_verify($email_raw) {
+  global $wpdb;
+  $email = sanitize_email($email_raw);
+  if (!$email || !is_email($email)) return ['ok' => false, 'msg' => 'Please enter a valid email address.'];
+
+  // Rate limit (10 min)
+  $key = 'tc_resend_public_' . md5(strtolower($email));
+  if (get_transient($key)) return ['ok' => false, 'msg' => 'Please wait a few minutes before requesting another email.'];
+  set_transient($key, 1, 10 * MINUTE_IN_SECONDS);
+
+  // Find VisitorID by Users (prefer most recent)
+  $vid = (int)$wpdb->get_var($wpdb->prepare(
+    "SELECT UserID FROM ".TC_USERS_TABLE." WHERE Email=%s AND UserType='Visitor' ORDER BY UserID DESC LIMIT 1", $email
+  ));
+
+  // Fallback via linked WP user
+  if (!$vid) {
+    $wp_user = get_user_by('email', $email);
+    if ($wp_user) $vid = (int) get_user_meta($wp_user->ID, 'tc_linked_visitor_id', true);
+  }
+
+  if (!$vid) return ['ok' => false, 'msg' => 'We could not find a registration with that email.'];
+
+  // Fresh token + send
+  $verify_table = tc_client_verify_table();
+  $token = wp_generate_password(32, false);
+  $wpdb->replace($verify_table, [
+    'VisitorID' => $vid,
+    'Token'     => $token,
+    'Verified'  => 0,
+  ], ['%d','%s','%d']);
+
+  $first = $wpdb->get_var($wpdb->prepare("SELECT FirstName FROM ".TC_USERS_TABLE." WHERE UserID=%d", $vid)) ?: '';
+  tc_send_verify_email($email, $first ?: $email, $vid, $token);
+
+  return ['ok' => true, 'msg' => 'We’ve sent a new verification link to your email.'];
+}
+
+/* ==============================
+ * Block WP login until verified (Clients)
+ * ============================== */
+add_filter('authenticate', function ($user, $username, $password) {
+  if ($user instanceof WP_User) {
+    $verified = get_user_meta($user->ID, 'tc_email_verified', true);
+    if ((string)$verified !== '1') {
+      $resend_url = add_query_arg([
+        'action'   => 'tc_resend',
+        'login'    => rawurlencode($user->user_login),
+        '_wpnonce' => wp_create_nonce('tc_resend_' . $user->user_login),
+      ], wp_login_url());
+      $msg = 'Please verify your email before logging in. ';
+      $msg .= '<a href="'.esc_url($resend_url).'">Resend verification email</a>';
+      return new WP_Error('tc_unverified', $msg);
+    }
+  }
+  return $user;
+}, 30, 3);
+
+/* ==============================
+ * Login page action: resend verify (Clients)
+ * ============================== */
+add_action('login_form_tc_resend', function () {
+  $login  = isset($_GET['login']) ? sanitize_user(wp_unslash($_GET['login'])) : '';
+  $nonce  = $_GET['_wpnonce'] ?? '';
+  if (!$login || !wp_verify_nonce($nonce, 'tc_resend_' . $login)) {
+    wp_redirect( add_query_arg('verification', 'invalid', wp_login_url()) );
+    exit;
+  }
+
+  $user = get_user_by('login', $login);
+  if (!$user) {
+    wp_redirect( add_query_arg('verification', 'invalid', wp_login_url()) );
+    exit;
+  }
+
+  // Rate limit: 10 minutes
+  $last = (int) get_user_meta($user->ID, 'tc_last_resend_at', true);
+  if ($last && (time() - $last) < 600) {
+    wp_redirect( add_query_arg('verification', 'rate', wp_login_url()) );
+    exit;
+  }
+
+  // Need a linked visitor and valid email
+  $visitor_id = (int) get_user_meta($user->ID, 'tc_linked_visitor_id', true);
+  $email      = $user->user_email;
+  if (!$visitor_id || !is_email($email)) {
+    wp_redirect( add_query_arg('verification', 'missing', wp_login_url()) );
+    exit;
+  }
+
+  global $wpdb;
+  $verify_table = tc_client_verify_table();
+  $token = wp_generate_password(32, false);
+  $wpdb->replace($verify_table, [
+    'VisitorID' => $visitor_id,
+    'Token'     => $token,
+    'Verified'  => 0,
+  ], ['%d','%s','%d']);
+
+  $first = $wpdb->get_var($wpdb->prepare("SELECT FirstName FROM ".TC_USERS_TABLE." WHERE UserID=%d", $visitor_id)) ?: '';
+  tc_send_verify_email($email, $first ?: $user->user_login, $visitor_id, $token);
+  update_user_meta($user->ID, 'tc_last_resend_at', time());
+
+  wp_redirect( add_query_arg('verification', 'resent', wp_login_url()) );
+  exit;
+});
+
+/* ==============================
+ * Shortcode: [client_form]
+ * - Full-page POST to ?tc_client_submit=1 (no JSON shown)
+ * - **CSS/markup kept EXACTLY as your original**
+ * ============================== */
+function tc_client_form_shortcode() {
+  ob_start(); ?>
+  <div class="form-container">
+    <a href="<?php echo esc_url(TC_CLIENT_HOME); ?>">
+      <img class="logo" src="https://theraconnect.net/wp-content/uploads/2025/06/LOGO-Thera-Connect-.png" alt="TheraConnect Logo" />
+    </a>
+
+    <style>
+      .form-container .tc-btn-primary{
+        background-color:#B48395;color:#fff;padding:10px 20px;border:none;border-radius:8px;
+        font-size:16px;cursor:pointer;transition:background-color .2s ease, transform .1s ease;
+      }
+      .form-container .tc-btn-primary:hover{background-color:#9e6d80;transform:scale(1.02);}
+      .form-container .form-row{display:flex; gap:10px; flex-wrap:wrap;}
+      .form-container input, .form-container select{width:100%; max-width:520px; padding:8px 10px; border:1px solid #ddd; border-radius:6px;}
+      .form-container .checkbox{display:flex; gap:8px; align-items:flex-start; margin:8px 0;}
+      .small-hint{color:#666; font-size:.9rem; margin-top:4px;}
+    </style>
+
+    <form method="POST" action="<?php echo esc_url( add_query_arg('tc_client_submit','1', home_url('/')) ); ?>">
+      <?php wp_nonce_field('save_client_nonce','_wpnonce'); ?>
+
+      <!-- moved inside the form -->
+      <h2>Client Registration</h2>
+
+      <div class="form-row">
+        <input type="text" name="firstName" placeholder="First Name" required />
+        <input type="text" name="lastName" placeholder="Last Name" required />
+      </div>
+
+      <!-- Email required (password moved to bottom) -->
+      <input type="email" name="email" placeholder="Email Address" required />
+
+      <div class="form-row">
+        <input type="tel" name="mobilePhone" placeholder="Mobile Phone" />
+        <input type="tel" name="phone" placeholder="Phone" />
+      </div>
+
+      <input type="text" name="street" placeholder="Street Address" />
+      <div class="form-row">
+        <input type="text" name="city" placeholder="City" />
+        <select name="state">
+          <option value="">State/Province</option>
+          <option value="AL">Alabama</option><option value="AK">Alaska</option><option value="AZ">Arizona</option>
+          <option value="AR">Arkansas</option><option value="CA">California</option><option value="CO">Colorado</option>
+          <option value="CT">Connecticut</option><option value="DE">Delaware</option><option value="FL">Florida</option>
+          <option value="GA">Georgia</option><option value="HI">Hawaii</option><option value="ID">Idaho</option>
+          <option value="IL">Illinois</option><option value="IN">Indiana</option><option value="IA">Iowa</option>
+          <option value="KS">Kansas</option><option value="KY">Kentucky</option><option value="LA">Louisiana</option>
+          <option value="ME">Maine</option><option value="MD">Maryland</option><option value="MA">Massachusetts</option>
+          <option value="MI">Michigan</option><option value="MN">Minnesota</option><option value="MS">Mississippi</option>
+          <option value="MO">Missouri</option><option value="MT">Montana</option><option value="NE">Nebraska</option>
+          <option value="NV">Nevada</option><option value="NH">New Hampshire</option><option value="NJ">New Jersey</option>
+          <option value="NM">New Mexico</option><option value="NY">New York</option><option value="NC">North Carolina</option>
+          <option value="ND">North Dakota</option><option value="OH">Ohio</option><option value="OK">Oklahoma</option>
+          <option value="OR">Oregon</option><option value="PA">Pennsylvania</option><option value="RI">Rhode Island</option>
+          <option value="SC">South Carolina</option><option value="SD">South Dakota</option><option value="TN">Tennessee</option>
+          <option value="TX">Texas</option><option value="UT">Utah</option><option value="VT">Vermont</option>
+          <option value="VA">Virginia</option><option value="WA">Washington</option><option value="WV">West Virginia</option>
+          <option value="WI">Wisconsin</option><option value="WY">Wyoming</option><option value="DC">District of Columbia</option>
+          <option value="Other">Outside U.S.</option>
+        </select>
+        <input type="text" name="zip" placeholder="Postal/Zip Code" />
+      </div>
+
+      <select name="country">
+        <option value="">Country</option>
+        <option value="United States">United States</option>
+        <option value="Canada">Canada</option>
+        <option value="Mexico">Mexico</option>
+        <option value="United Kingdom">United Kingdom</option>
+        <option value="Australia">Australia</option>
+        <option value="New Zealand">New Zealand</option>
+        <option value="Ireland">Ireland</option>
+        <option value="India">India</option>
+        <option value="Philippines">Philippines</option>
+        <option value="Germany">Germany</option>
+        <option value="France">France</option>
+        <option value="Italy">Italy</option>
+        <option value="Spain">Spain</option>
+        <option value="Other">Other</option>
+      </select>
+
+      <select name="visitType" required>
+        <option value="">Preferred Type of Visit</option>
+        <option value="virtual">Virtual</option>
+        <option value="in-person">In-Person</option>
+        <option value="either">Either</option>
+      </select>
+
+      <select name="insuranceRequired">
+        <option value="">Do You Have Insurance?</option>
+        <option value="Yes">Yes</option>
+        <option value="No">No</option>
+      </select>
+
+      <input type="text" name="insuranceProvider" placeholder="Primary Insurance" />
+      <input type="text" name="insuranceNumber" placeholder="Primary Insurance Number" />
+      <input type="text" name="preferredProvider" placeholder="Preferred Healthcare Professional" />
+
+      <!-- Passwords -->
+      <input type="password" name="wp_password" placeholder="Create a password (min 8 chars)" minlength="8" required />
+      <input type="password" name="wp_password_confirm" placeholder="Confirm password" minlength="8" />
+
+      <!-- Match Pros hint -->
+      <div class="small-hint">You’ll need to verify your email before logging in.</div>
+
+      <label class="checkbox">
+        <input type="checkbox" name="consent" value="Yes" required />
+        <span>By submitting, you agree to share your info with TheraConnect’s healthcare professional network.</span>
+      </label>
+
+      <button type="submit" class="tc-btn-primary">Register</button>
+    </form>
+  </div>
+  <?php
+  return ob_get_clean();
+}
+add_shortcode('client_form', 'tc_client_form_shortcode');
+
+/* ==============================
+ * DELETE SUPPORT (single + bulk)
+ * ============================== */
+
+// Delete helper: removes Visitor records + related rows, unlinks WP users (does not delete WP users)
+function tc_delete_clients(array $ids) {
+  if (!current_user_can('delete_users')) {
+    return new WP_Error('forbidden', 'You do not have permission to delete clients.');
+  }
+
+  $ids = array_values(array_filter(array_map('absint', $ids)));
+  if (!$ids) return 0;
+
+  global $wpdb;
+  $users_tbl  = TC_USERS_TABLE;
+  $verify_tbl = tc_client_verify_table();
+  $visreq_tbl = TC_VISITOR_REQ_TABLE;
+
+  // Unlink any WP users that were linked to these visitors (do not delete WP users)
+  foreach ($ids as $vid) {
+    $user_ids = get_users([
+      'fields'     => 'ID',
+      'meta_key'   => 'tc_linked_visitor_id',
+      'meta_value' => $vid,
+    ]);
+    foreach ($user_ids as $uid) {
+      delete_user_meta($uid, 'tc_linked_visitor_id');
+      delete_user_meta($uid, 'tc_email_verified'); // optional: cleanup
+    }
+  }
+
+  $placeholders = implode(',', array_fill(0, count($ids), '%d'));
+
+  // Delete related rows first
+  $wpdb->query($wpdb->prepare("DELETE FROM `$visreq_tbl` WHERE VisitorID IN ($placeholders)", $ids));
+  $wpdb->query($wpdb->prepare("DELETE FROM `$verify_tbl` WHERE VisitorID IN ($placeholders)", $ids));
+
+  // Finally delete from Users (only Visitors)
+  $deleted = $wpdb->query($wpdb->prepare(
+    "DELETE FROM `$users_tbl` WHERE UserType='Visitor' AND UserID IN ($placeholders)", $ids
+  ));
+
+  return (int)$deleted;
+}
+
+/* ==============================
+ * Admin: Clients list page (search, filters, export, delete)
+ * ============================== */
+add_action('admin_menu', function () {
+  add_menu_page(
+    'TheraConnect Clients',
+    'TheraConnect Clients',
+    'list_users',
+    'tc-clients',
+    'tc_render_clients_page',
+    'dashicons-admin-users',
+    59
+  );
+  add_submenu_page(
+    'tc-clients',
+    'Clients',
+    'Clients',
+    'list_users',
+    'tc-clients',
+    'tc_render_clients_page'
+  );
+});
+
+function tc_render_clients_page() {
+  if (!current_user_can('list_users')) {
+    wp_die('You do not have sufficient permissions to access this page.');
+  }
+
+  // ---- Handle single delete (GET) before queries ----
+  if (isset($_GET['tc_action']) && $_GET['tc_action'] === 'delete' && isset($_GET['id'])) {
+    $id = absint($_GET['id']);
+    check_admin_referer('tc_delete_client_' . $id);
+    $res = tc_delete_clients([$id]);
+    if (is_wp_error($res)) {
+      wp_redirect( add_query_arg(['tc_deleted' => '0', 'tc_err' => $res->get_error_message()], menu_page_url('tc-clients', false)) );
+    } else {
+      wp_redirect( add_query_arg(['tc_deleted' => (int)$res], menu_page_url('tc-clients', false)) );
+    }
+    exit;
+  }
+
+  // ---- Handle bulk delete (POST) before queries ----
+  if (isset($_POST['tc_bulk_delete']) && isset($_POST['ids']) && is_array($_POST['ids'])) {
+    check_admin_referer('tc_bulk_delete_clients');
+    $ids = array_map('absint', $_POST['ids']);
+    $res = tc_delete_clients($ids);
+    if (is_wp_error($res)) {
+      wp_redirect( add_query_arg(['tc_deleted' => '0', 'tc_err' => $res->get_error_message()], menu_page_url('tc-clients', false)) );
+    } else {
+      wp_redirect( add_query_arg(['tc_deleted' => (int)$res], menu_page_url('tc-clients', false)) );
+    }
+    exit;
+  }
+
+  global $wpdb;
+  $users_tbl   = TC_USERS_TABLE;
+  $verify_tbl  = tc_client_verify_table();
+  $visreq_tbl  = TC_VISITOR_REQ_TABLE;
+
+  // Params
+  $per_page = max(5, min(100, intval($_GET['per_page'] ?? 20)));
+  $paged    = max(1, intval($_GET['paged'] ?? 1));
+  $search   = trim(sanitize_text_field($_GET['s'] ?? ''));
+  $vfilter  = sanitize_text_field($_GET['verified'] ?? ''); // '', '1', '0'
+  $visitf   = sanitize_text_field($_GET['visit'] ?? '');    // '', 'Telemed','In-Person','Telemed/In-Person'
+  $insf     = sanitize_text_field($_GET['ins'] ?? '');      // '', '1','0'
+
+  // WHERE builder
+  $where = "WHERE u.UserType='Visitor'";
+  $args  = [];
+  if ($search !== '') {
+    $where .= " AND (u.Email LIKE %s OR u.FirstName LIKE %s OR u.LastName LIKE %s OR u.City LIKE %s)";
+    $q = '%' . $wpdb->esc_like($search) . '%';
+    $args = array_merge($args, [$q,$q,$q,$q]);
+  }
+  if ($vfilter === '1' || $vfilter === '0') {
+    $where .= " AND IFNULL(v.Verified,0)=" . intval($vfilter);
+  }
+  if ($visitf !== '') {
+    $where .= " AND u.PreferredVisitType=%s";
+    $args[] = $visitf;
+  }
+  if ($insf === '1' || $insf === '0') {
+    $where .= " AND IFNULL(u.InsuranceRequired, -1)=" . intval($insf);
+  }
+
+  // Count
+  $count_sql = "SELECT COUNT(*)
+                FROM `$users_tbl` u
+                LEFT JOIN `$verify_tbl` v ON v.VisitorID=u.UserID
+                LEFT JOIN `$visreq_tbl` vr ON vr.VisitorID=u.UserID
+                $where";
+  $count_q = $args ? $wpdb->prepare($count_sql, $args) : $count_sql;
+  $total = (int)$wpdb->get_var($count_q);
+
+  // Page rows
+  $offset = ($paged - 1) * $per_page;
+  $sql = "SELECT 
+            u.UserID, u.FirstName, u.LastName, u.Email, u.City, u.StateProvince, u.Country,
+            u.PreferredVisitType, u.InsuranceRequired, u.CreatedAt,
+            IFNULL(v.Verified,0) as Verified,
+            vr.PrimaryInsurance, vr.PrimaryInsuranceNumber, vr.HealthcareProfessionalPreferred
+          FROM `$users_tbl` u
+          LEFT JOIN `$verify_tbl` v ON v.VisitorID=u.UserID
+          LEFT JOIN `$visreq_tbl` vr ON vr.VisitorID=u.UserID
+          $where
+          ORDER BY u.CreatedAt DESC
+          LIMIT %d OFFSET %d";
+  $args_paged = $args;
+  $args_paged[] = $per_page;
+  $args_paged[] = $offset;
+  $rows_q = $wpdb->prepare($sql, $args_paged);
+  $rows = $wpdb->get_results($rows_q);
+
+  // Base URL and export URL
+  $base = menu_page_url('tc-clients', false);
+  $qs   = [];
+  if ($search !== '') $qs['s'] = $search;
+  if ($vfilter !== '') $qs['verified'] = $vfilter;
+  if ($visitf !== '')  $qs['visit'] = $visitf;
+  if ($insf !== '')    $qs['ins'] = $insf;
+  if ($per_page !== 20) $qs['per_page'] = $per_page;
+
+  // CSV Export
+  if (isset($_GET['tc_export']) && $_GET['tc_export'] === '1' && check_admin_referer('tc_export_clients')) {
+    $esql = "SELECT 
+              u.UserID, u.FirstName, u.LastName, u.Email, u.City, u.StateProvince, u.Country,
+              u.PreferredVisitType, u.InsuranceRequired, u.CreatedAt,
+              IFNULL(v.Verified,0) as Verified,
+              vr.PrimaryInsurance, vr.PrimaryInsuranceNumber, vr.HealthcareProfessionalPreferred
+            FROM `$users_tbl` u
+            LEFT JOIN `$verify_tbl` v ON v.VisitorID=u.UserID
+            LEFT JOIN `$visreq_tbl` vr ON vr.VisitorID=u.UserID
+            $where
+            ORDER BY u.CreatedAt DESC";
+    $export_q = $args ? $wpdb->prepare($esql, $args) : $esql;
+
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename=theraconnect_clients.csv');
+    $out = fopen('php://output', 'w');
+    $export_rows = $wpdb->get_results($export_q, ARRAY_A);
+    fputcsv($out, array_keys($export_rows && isset($export_rows[0]) ? $export_rows[0] : [
+      'UserID','FirstName','LastName','Email','City','StateProvince','Country','PreferredVisitType','InsuranceRequired','CreatedAt','Verified','PrimaryInsurance','PrimaryInsuranceNumber','HealthcareProfessionalPreferred'
+    ]));
+    if ($export_rows) {
+      foreach ($export_rows as $r) fputcsv($out, $r);
+    }
+    fclose($out);
+    exit;
+  }
+  $export_url  = wp_nonce_url(add_query_arg(array_merge($qs, ['tc_export' => '1']), $base), 'tc_export_clients');
+
+  // Pagination
+  $total_pages = max(1, ceil($total / $per_page));
+  ?>
+  <div class="wrap">
+    <h1>Clients</h1>
+
+    <?php if (isset($_GET['tc_deleted'])): 
+      $num = intval($_GET['tc_deleted']);
+      $err = isset($_GET['tc_err']) ? sanitize_text_field($_GET['tc_err']) : '';
+      if ($num > 0): ?>
+        <div class="notice notice-success is-dismissible"><p><?php echo esc_html($num); ?> client(s) deleted.</p></div>
+      <?php elseif ($err): ?>
+        <div class="notice notice-error is-dismissible"><p>Delete failed: <?php echo esc_html($err); ?></p></div>
+      <?php else: ?>
+        <div class="notice notice-warning is-dismissible"><p>No clients were deleted.</p></div>
+      <?php endif; ?>
+    <?php endif; ?>
+
+    <!-- Filters (GET) -->
+    <form method="get" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="hidden" name="page" value="tc-clients" />
+      <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="Search name, email, city…" class="regular-text" />
+      <select name="verified">
+        <option value="">Any status</option>
+        <option value="1" <?php selected($vfilter,'1'); ?>>Verified</option>
+        <option value="0" <?php selected($vfilter,'0'); ?>>Unverified</option>
+      </select>
+      <select name="visit">
+        <option value="">Any visit type</option>
+        <?php foreach (['Telemed','In-Person','Telemed/In-Person'] as $vt): ?>
+          <option value="<?php echo esc_attr($vt); ?>" <?php selected($visitf,$vt); ?>><?php echo esc_html($vt); ?></option>
+        <?php endforeach; ?>
+      </select>
+      <select name="ins">
+        <option value="">Any insurance</option>
+        <option value="1" <?php selected($insf,'1'); ?>>Has insurance</option>
+        <option value="0" <?php selected($insf,'0'); ?>>No insurance</option>
+      </select>
+      <select name="per_page">
+        <?php foreach ([10,20,50,100] as $n): ?>
+          <option value="<?php echo $n; ?>" <?php selected($per_page,$n); ?>><?php echo $n; ?>/page</option>
+        <?php endforeach; ?>
+      </select>
+      <button class="button">Filter</button>
+      <a class="button button-primary" href="<?php echo esc_url($export_url); ?>">Export CSV</a>
+    </form>
+
+    <!-- Bulk delete form (POST) -->
+    <form method="post" style="margin-top:10px;">
+      <?php wp_nonce_field('tc_bulk_delete_clients'); ?>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <select name="bulk_action">
+          <option value="">Bulk actions</option>
+          <option value="delete">Delete selected</option>
+        </select>
+        <button type="submit" class="button button-secondary" name="tc_bulk_delete" value="1"
+                onclick="return (this.form.bulk_action.value==='delete') ? confirm('Delete selected clients? This cannot be undone.') : true;">
+          Apply
+        </button>
+      </div>
+
+      <table class="wp-list-table widefat fixed striped" style="margin-top:12px">
+        <thead>
+        <tr>
+          <th width="30"><input type="checkbox" onclick="jQuery('.tc-row-check').prop('checked', this.checked);" /></th>
+          <th width="70">ID</th>
+          <th>Name</th>
+          <th>Email</th>
+          <th>City/State</th>
+          <th>Visit Type</th>
+          <th>Insurance</th>
+          <th>Primary Insurance</th>
+          <th>Verified</th>
+          <th>Created</th>
+          <th>Actions</th>
+        </tr>
+        </thead>
+        <tbody>
+        <?php if ($rows): foreach ($rows as $r):
+          $delete_url = wp_nonce_url(
+            add_query_arg(['tc_action'=>'delete','id'=>(int)$r->UserID], menu_page_url('tc-clients', false)),
+            'tc_delete_client_' . (int)$r->UserID
+          );
+        ?>
+          <tr>
+            <td><input class="tc-row-check" type="checkbox" name="ids[]" value="<?php echo (int)$r->UserID; ?>" /></td>
+            <td><?php echo (int)$r->UserID; ?></td>
+            <td><?php echo esc_html(trim($r->FirstName.' '.$r->LastName)); ?></td>
+            <td><a href="mailto:<?php echo esc_attr($r->Email); ?>"><?php echo esc_html($r->Email); ?></a></td>
+            <td><?php echo esc_html(trim(($r->City?:'') . (($r->StateProvince)? ', '.$r->StateProvince : ''))); ?></td>
+            <td><?php echo esc_html($r->PreferredVisitType ?: '—'); ?></td>
+            <td><?php echo ($r->InsuranceRequired===null ? '—' : ($r->InsuranceRequired ? 'Yes' : 'No')); ?></td>
+            <td><?php echo esc_html($r->PrimaryInsurance ?: '—'); ?></td>
+            <td><?php echo $r->Verified ? '<span style="color:#136f35;font-weight:600">Yes</span>' : '<span style="color:#b71c1c">No</span>'; ?></td>
+            <td><?php echo esc_html( mysql2date('Y-m-d H:i', $r->CreatedAt) ); ?></td>
+            <td>
+              <a href="<?php echo esc_url($delete_url); ?>"
+                 onclick="return confirm('Delete this client? This cannot be undone.');">Delete</a>
+            </td>
+          </tr>
+        <?php endforeach; else: ?>
+          <tr><td colspan="11">No clients found.</td></tr>
+        <?php endif; ?>
+        </tbody>
+      </table>
+
+      <?php
+      // Pagination UI
+      $total_pages = max(1, ceil($total / $per_page));
+      if ($total_pages > 1):
+        $qs_page = $qs; ?>
+        <div class="tablenav-pages" style="margin-top:12px">
+          <span class="displaying-num"><?php echo (int)$total; ?> items</span>
+          <span class="pagination-links">
+            <?php
+            $qs_page['paged'] = 1;
+            $first = add_query_arg($qs_page, $base);
+            $qs_page['paged'] = max(1, $paged-1);
+            $prev  = add_query_arg($qs_page, $base);
+            $qs_page['paged'] = min($total_pages, $paged+1);
+            $next  = add_query_arg($qs_page, $base);
+            $qs_page['paged'] = $total_pages;
+            $last  = add_query_arg($qs_page, $base);
+            ?>
+            <a class="first-page button <?php disabled($paged,1); ?>" href="<?php echo esc_url($first); ?>">&laquo;</a>
+            <a class="prev-page button <?php disabled($paged,1); ?>" href="<?php echo esc_url($prev); ?>">&lsaquo;</a>
+            <span class="paging-input">
+              <input class="current-page" type="text" name="paged" value="<?php echo (int)$paged; ?>" size="2" />
+              <span class="tablenav-paging-text"> of <span class="total-pages"><?php echo (int)$total_pages; ?></span></span>
+            </span>
+            <a class="next-page button <?php disabled($paged,$total_pages); ?>" href="<?php echo esc_url($next); ?>">&rsaquo;</a>
+            <a class="last-page button <?php disabled($paged,$total_pages); ?>" href="<?php echo esc_url($last); ?>">&raquo;</a>
+          </span>
+        </div>
+      <?php endif; ?>
+
+    </form><!-- end bulk delete form -->
+  </div>
+  <?php
+}
+
+/* ==============================
+ * Dashboard widget: Clients snapshot
+ * ============================== */
+add_action('wp_dashboard_setup', function () {
+  if (!current_user_can('list_users')) return;
+  wp_add_dashboard_widget('tc_clients_widget', 'TheraConnect Clients — Snapshot', 'tc_render_clients_widget');
+});
+
+function tc_render_clients_widget() {
+  global $wpdb;
+  $users_tbl  = TC_USERS_TABLE;
+  $verify_tbl = tc_client_verify_table();
+
+  $total = (int)$wpdb->get_var("SELECT COUNT(*) FROM `$users_tbl` WHERE UserType='Visitor'");
+  $verified = (int)$wpdb->get_var(
+    "SELECT COUNT(*) FROM `$users_tbl` u
+     INNER JOIN `$verify_tbl` v ON v.VisitorID=u.UserID AND v.Verified=1
+     WHERE u.UserType='Visitor'"
+  );
+  $unverified = max(0, $total - $verified);
+
+  $recent = $wpdb->get_results(
+    "SELECT u.UserID, u.FirstName, u.LastName, u.Email, u.CreatedAt
+     FROM `$users_tbl` u
+     WHERE u.UserType='Visitor'
+     ORDER BY u.CreatedAt DESC
+     LIMIT 5"
+  );
+
+  $admin_list_url = menu_page_url('tc-clients', false);
+  ?>
+  <div style="display:flex; gap:14px; flex-wrap:wrap">
+    <div style="flex:1 1 120px; background:#fff; border:1px solid #e6e6ef; border-radius:8px; padding:10px 12px">
+      <div style="font-size:12px;color:#666">Total</div>
+      <div style="font-size:20px;font-weight:700"><?php echo (int)$total; ?></div>
+    </div>
+    <div style="flex:1 1 120px; background:#fff; border:1px solid #e6e6ef; border-radius:8px; padding:10px 12px">
+      <div style="font-size:12px;color:#666">Verified</div>
+      <div style="font-size:20px;font-weight:700;color:#136f35"><?php echo (int)$verified; ?></div>
+    </div>
+    <div style="flex:1 1 120px; background:#fff; border:1px solid #e6e6ef; border-radius:8px; padding:10px 12px">
+      <div style="font-size:12px;color:#666">Unverified</div>
+      <div style="font-size:20px;font-weight:700;color:#b71c1c"><?php echo (int)$unverified; ?></div>
+    </div>
+  </div>
+
+  <h4 style="margin:12px 0 8px">Recent registrations</h4>
+  <ul>
+    <?php if ($recent): foreach ($recent as $r): ?>
+      <li>
+        <strong><?php echo esc_html(trim($r->FirstName.' '.$r->LastName)); ?></strong>
+        &lt;<a href="mailto:<?php echo esc_attr($r->Email); ?>"><?php echo esc_html($r->Email); ?></a>&gt;
+        — <?php echo esc_html( mysql2date('Y-m-d H:i', $r->CreatedAt) ); ?>
+      </li>
+    <?php endforeach; else: ?>
+      <li>No recent registrations.</li>
+    <?php endif; ?>
+  </ul>
+
+  <p><a class="button button-primary" href="<?php echo esc_url($admin_list_url); ?>">View all Clients</a></p>
+  <?php
+}
