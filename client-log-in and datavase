@@ -2,7 +2,7 @@
 /*
 Plugin Name: TheraConnect Clients (DB + Admin List/Export + Verify + WP Account + Delete)
 Description: Client registration to custom tables + required email/password + email verification (blocks WP login until verified) + resend verify + full-page POST (no JSON) + safe duplicate-email handling. Adds DB tables, Admin list/search/export, Dashboard widget, and delete (single + bulk). Separate from Pros. Keeps original CSS/markup intact.
-Version: 2.4
+Version: 2.5
 Author: You
 */
 
@@ -201,14 +201,19 @@ function tc_handle_client_submission() {
     'PostalZipCode'      => $zip,
     'Country'            => $country,
     'PreferredVisitType' => $visit,
-    'InsuranceRequired'  => $ins_req,
+    // InsuranceRequired handled below (omit when null)
   ];
 
   $fmt_user = [
     '%s','%s','%s','%s','%s','%s','%s',
     '%s','%s','%s','%s','%s','%s','%s',
-    '%s','%s','%d'
+    '%s','%s'
   ];
+
+  if (!is_null($ins_req)) {
+    $user_row['InsuranceRequired'] = (int)$ins_req;
+    $fmt_user[] = '%d';
+  }
 
   $ok_user = $wpdb->insert($users_tbl, $user_row, $fmt_user);
 
@@ -251,19 +256,20 @@ function tc_handle_client_submission() {
     'VisitorID'                       => $visitor_id,
     'HealthcareProfessionalPreferred' => $prof_id,
     'PreferredVisitType'              => $visit,
-    'InsuranceRequired'               => $ins_req,
+    'InsuranceRequired'               => $ins_req, // may be null
     'PrimaryInsurance'                => $ins_prov,
     'PrimaryInsuranceNumber'          => $ins_num,
   ];
   $ok_vr = $wpdb->insert($visreq_tbl, $vr_row, ['%d','%d','%s','%d','%s','%s']);
   if (!$ok_vr) wp_die('DB error (VisitorRequests): ' . esc_html($wpdb->last_error));
 
-  /* 4) Upsert verify token */
+  /* 4) Upsert verify token (store hash only) */
   $verify_table = tc_client_verify_table();
-  $token = wp_generate_password(32, false);
+  $raw_token    = wp_generate_password(32, false);
+  $hash_token   = hash_hmac('sha256', $raw_token, wp_salt('auth'));
   $wpdb->replace($verify_table, [
     'VisitorID' => $visitor_id,
-    'Token'     => $token,
+    'Token'     => $hash_token,
     'Verified'  => 0,
   ], ['%d','%s','%d']);
 
@@ -285,7 +291,7 @@ function tc_handle_client_submission() {
   }
 
   /* 6) Send verification email (scoped sender) */
-  if ($email) tc_send_verify_email($email, $first ?: $email, $visitor_id, $token);
+  if ($email) tc_send_verify_email($email, $first ?: $email, $visitor_id, $raw_token);
 
   /* 7) Notify admin (scoped sender) */
   $admin_email = 'admin@theraconnect.net';
@@ -333,11 +339,12 @@ add_action('template_redirect', function () {
     return;
   }
 
-  // 2) Public resend POST
+  // 2) Public resend POST (generic responses to prevent enumeration)
   if (isset($_GET['tc_resend_public']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $nonce = $_POST['_wpnonce'] ?? '';
     if (!wp_verify_nonce($nonce, 'tc_public_resend')) wp_die('Invalid request.');
     $res = tc_public_resend_verify($_POST['resend_email'] ?? '');
+
     status_header(200);
     ?>
     <!doctype html>
@@ -345,21 +352,19 @@ add_action('template_redirect', function () {
     <head>
       <meta charset="<?php bloginfo('charset'); ?>">
       <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title><?php echo $res['ok'] ? 'Verification Email Sent' : 'Resend Failed'; ?></title>
+      <title>Verification Email</title>
       <?php wp_head(); ?>
       <style>
         .tc-verify-wrap{max-width:640px;margin:8rem auto;padding:2rem;border-radius:14px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08);font-family:system-ui,-apple-system,Segoe UI,Roboto}
-        .tc-ok{color:#136f35}.tc-bad{color:#b71c1c}
         .tc-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:8px}
         .tc-btn{display:inline-block;padding:.65rem 1rem;border-radius:10px;text-decoration:none}
         .tc-primary{background:#3f51b5;color:#fff}
-        .tc-ghost{border:1px solid #dcdce7}
       </style>
     </head>
     <body>
       <div class="tc-verify-wrap">
-        <h1><?php echo $res['ok'] ? 'Check your inbox' : 'Resend verification'; ?></h1>
-        <p class="<?php echo $res['ok'] ? 'tc-ok' : 'tc-bad'; ?>"><?php echo esc_html($res['msg']); ?></p>
+        <h1>Check your inbox</h1>
+        <p><?php echo esc_html($res['msg']); ?></p>
         <div class="tc-actions">
           <a class="tc-btn tc-primary" href="<?php echo esc_url( TC_SUCCESS_REDIRECT ); ?>">Go to TheraConnect</a>
         </div>
@@ -371,32 +376,35 @@ add_action('template_redirect', function () {
     exit;
   }
 
-  // 3) Verification view (kept CSS as-is, redirect to Thank You on success)
+  // 3) Verification view (redirect to Thank You on success)
   if (!isset($_GET['tc_verify'])) return;
 
-  $vid   = absint($_GET['vid'] ?? 0);
-  $token = sanitize_text_field($_GET['token'] ?? '');
+  $vid      = absint($_GET['vid'] ?? 0);
+  $token_in = sanitize_text_field($_GET['token'] ?? '');
 
   status_header(200);
   nocache_headers();
 
   global $wpdb;
   $ok = false;
-  if ($vid && $token) {
+  if ($vid && $token_in !== '') {
     $verify_table = tc_client_verify_table();
-    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM `$verify_table` WHERE VisitorID=%d", $vid));
-    if ($row && hash_equals($row->Token, $token) && (int)$row->Verified === 0) {
-      $wpdb->update($verify_table, ['Verified' => 1], ['VisitorID' => $vid], ['%d'], ['%d']);
-      $ok = true;
+    $row = $wpdb->get_row($wpdb->prepare("SELECT Token, Verified FROM `$verify_table` WHERE VisitorID=%d", $vid));
+    if ($row && (int)$row->Verified === 0) {
+      $calc = hash_hmac('sha256', $token_in, wp_salt('auth'));
+      if (hash_equals($row->Token, $calc)) {
+        $wpdb->update($verify_table, ['Verified' => 1], ['VisitorID' => $vid], ['%d'], ['%d']);
+        $ok = true;
 
-      // Flip any linked WP users to verified
-      $wp_users = get_users([
-        'meta_key'   => 'tc_linked_visitor_id',
-        'meta_value' => $vid,
-        'fields'     => 'ID',
-      ]);
-      foreach ($wp_users as $uid) {
-        update_user_meta($uid, 'tc_email_verified', 1);
+        // Flip any linked WP users to verified
+        $wp_users = get_users([
+          'meta_key'   => 'tc_linked_visitor_id',
+          'meta_value' => $vid,
+          'fields'     => 'ID',
+        ]);
+        foreach ($wp_users as $uid) {
+          update_user_meta($uid, 'tc_email_verified', 1);
+        }
       }
     }
   }
@@ -432,9 +440,7 @@ add_action('template_redirect', function () {
         <div class="tc-actions">
           <a class="tc-btn tc-primary" href="<?php echo esc_url( TC_SUCCESS_REDIRECT ); ?>">Continue</a>
         </div>
-        <script>
-          setTimeout(function(){ window.location.href = "<?php echo esc_js( TC_SUCCESS_REDIRECT ); ?>"; }, 2000);
-        </script>
+        <script>setTimeout(function(){ window.location.href = "<?php echo esc_js( TC_SUCCESS_REDIRECT ); ?>"; }, 2000);</script>
       <?php else: ?>
         <p class="tc-bad">The verification link is invalid or already used.</p>
         <div class="tc-resend-box">
@@ -457,43 +463,45 @@ add_action('template_redirect', function () {
   exit;
 });
 
-/** Public resend-by-email */
+/** Public resend-by-email (generic response to prevent enumeration) */
 function tc_public_resend_verify($email_raw) {
   global $wpdb;
   $email = sanitize_email($email_raw);
-  if (!$email || !is_email($email)) return ['ok' => false, 'msg' => 'Please enter a valid email address.'];
+  // Always respond generically after basic format check
+  $generic = ['ok' => true, 'msg' => 'If that email is registered, a new verification link has been sent.'];
+  if (!$email || !is_email($email)) return $generic;
 
   // Rate limit (10 min)
   $key = 'tc_resend_public_' . md5(strtolower($email));
-  if (get_transient($key)) return ['ok' => false, 'msg' => 'Please wait a few minutes before requesting another email.'];
+  if (get_transient($key)) return $generic;
   set_transient($key, 1, 10 * MINUTE_IN_SECONDS);
 
-  // Find VisitorID by Users (prefer most recent)
+  // Try to resolve VisitorID quietly
   $vid = (int)$wpdb->get_var($wpdb->prepare(
     "SELECT UserID FROM ".TC_USERS_TABLE." WHERE Email=%s AND UserType='Visitor' ORDER BY UserID DESC LIMIT 1", $email
   ));
 
-  // Fallback via linked WP user
   if (!$vid) {
     $wp_user = get_user_by('email', $email);
     if ($wp_user) $vid = (int) get_user_meta($wp_user->ID, 'tc_linked_visitor_id', true);
   }
 
-  if (!$vid) return ['ok' => false, 'msg' => 'We could not find a registration with that email.'];
+  if ($vid) {
+    // Issue new hashed token and email the raw
+    $verify_table = tc_client_verify_table();
+    $raw   = wp_generate_password(32, false);
+    $hash  = hash_hmac('sha256', $raw, wp_salt('auth'));
+    $wpdb->replace($verify_table, [
+      'VisitorID' => $vid,
+      'Token'     => $hash,
+      'Verified'  => 0,
+    ], ['%d','%s','%d']);
 
-  // Fresh token + send
-  $verify_table = tc_client_verify_table();
-  $token = wp_generate_password(32, false);
-  $wpdb->replace($verify_table, [
-    'VisitorID' => $vid,
-    'Token'     => $token,
-    'Verified'  => 0,
-  ], ['%d','%s','%d']);
+    $first = $wpdb->get_var($wpdb->prepare("SELECT FirstName FROM ".TC_USERS_TABLE." WHERE UserID=%d", $vid)) ?: '';
+    tc_send_verify_email($email, $first ?: $email, $vid, $raw);
+  }
 
-  $first = $wpdb->get_var($wpdb->prepare("SELECT FirstName FROM ".TC_USERS_TABLE." WHERE UserID=%d", $vid)) ?: '';
-  tc_send_verify_email($email, $first ?: $email, $vid, $token);
-
-  return ['ok' => true, 'msg' => 'We’ve sent a new verification link to your email.'];
+  return $generic;
 }
 
 /* ==============================
@@ -550,15 +558,18 @@ add_action('login_form_tc_resend', function () {
 
   global $wpdb;
   $verify_table = tc_client_verify_table();
-  $token = wp_generate_password(32, false);
+
+  // New hashed token + email raw
+  $raw  = wp_generate_password(32, false);
+  $hash = hash_hmac('sha256', $raw, wp_salt('auth'));
   $wpdb->replace($verify_table, [
     'VisitorID' => $visitor_id,
-    'Token'     => $token,
+    'Token'     => $hash,
     'Verified'  => 0,
   ], ['%d','%s','%d']);
 
   $first = $wpdb->get_var($wpdb->prepare("SELECT FirstName FROM ".TC_USERS_TABLE." WHERE UserID=%d", $visitor_id)) ?: '';
-  tc_send_verify_email($email, $first ?: $user->user_login, $visitor_id, $token);
+  tc_send_verify_email($email, $first ?: $user->user_login, $visitor_id, $raw);
   update_user_meta($user->ID, 'tc_last_resend_at', time());
 
   wp_redirect( add_query_arg('verification', 'resent', wp_login_url()) );
